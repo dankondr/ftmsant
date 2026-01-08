@@ -1,74 +1,82 @@
-import time
+import asyncio
 import itertools
+import sys
 import threading
-import queue
-from openant.easy.node import Node
+import time
+from typing import Optional
+
+from bleak import BleakClient, BleakScanner
+from loguru import logger
 from openant.easy.channel import Channel
+from openant.easy.node import Node
 
 ANTPLUS_NETWORK = 0
-# Standard ANT+ network key (B9 A5 21 FB BD 72 C3 45).
 ANTPLUS_KEY = list(bytes.fromhex("B9A521FBBD72C345"))
 
-DEVICE_NUMBER = 12345
+DEVICE_NAME = "UnixFit SB-700"
+DEVICE_NUMBER = 700
 DEVICE_TYPE = 0x11
 TRANSMISSION_TYPE = 0x05
 
 RF_FREQ = 57
 CHANNEL_PERIOD = 8192  # 4 Hz
 
-MANUFACTURER_ID = 0xFFFF
-MODEL_NUMBER = 1
-HW_REVISION = 1
-SW_REVISION = 1
-SW_REVISION_SUP = 0xFF
-SERIAL_NUMBER = 1
+FTMS_DEVICE_NAME = "SB-700"
+FTMS_SERVICE_UUID = "00001826-0000-1000-8000-00805f9b34fb"
+FTMS_CHAR_INDOOR_BIKE_DATA = "00002ad2-0000-1000-8000-00805f9b34fb"
+FTMS_CHAR_CONTROL_POINT = "00002ad9-0000-1000-8000-00805f9b34fb"
 
-REQUEST_PAGE = 0x46
-REQUEST_COMMAND_DATA_PAGE = 0x01
-REQUESTED_RESPONSE_COUNT_MASK = 0x7F
-REQUESTED_RESPONSE_ACK_MASK = 0x80
+FTMS_OP_REQUEST_CONTROL = 0x00
+FTMS_OP_START_OR_RESUME = 0x07
 
 FE_TYPE_TRAINER = 25
+FE_STATE_READY = 2
 FE_STATE_IN_USE = 3
 
-FE_CAP_BASIC_RESISTANCE = 1 << 0
-FE_CAP_TARGET_POWER = 1 << 1
-FE_CAP_SIMULATION = 1 << 2
 
-TRAINER_CAPABILITIES = [
-    0x36,
-    0xFF,
-    0xFF,
-    0xFF,
-    0xFF,
-    0xFF,
-    0xFF,
-    FE_CAP_BASIC_RESISTANCE | FE_CAP_TARGET_POWER,
-]
+class BridgeState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.speed_mps: Optional[float] = None
+        self.cadence_rpm: Optional[int] = None
+        self.instant_power: Optional[int] = None
+        self.distance_m: Optional[int] = None
+        self.elapsed_time_s: Optional[int] = None
+        self.last_ftms_update: Optional[float] = None
 
 
-def _le16(value: int) -> list[int]:
-    return [value & 0xFF, (value >> 8) & 0xFF]
+def clamp_int(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
 
 
-def _le32(value: int) -> list[int]:
-    return [
-        value & 0xFF,
-        (value >> 8) & 0xFF,
-        (value >> 16) & 0xFF,
-        (value >> 24) & 0xFF,
-    ]
+def compute_fe_state(cadence_rpm: Optional[int], power_w: Optional[int]) -> int:
+    if (cadence_rpm or 0) > 0 or (power_w or 0) > 0:
+        return FE_STATE_IN_USE
+    return FE_STATE_READY
 
 
-def build_page_10(elapsed_time: int, speed_mps: float) -> list[int]:
-    speed = int(speed_mps * 1000.0) & 0xFFFF
-    capabilities = 0x00
-    fe_state = (FE_STATE_IN_USE & 0x0F) << 4
+def build_page_10(
+    elapsed_time: int,
+    speed_mps: Optional[float],
+    distance_m: Optional[int],
+    fe_state: int,
+) -> list[int]:
+    if speed_mps is None:
+        speed = 0xFFFF
+    else:
+        speed = int(max(0.0, speed_mps) * 1000.0) & 0xFFFF
+    if distance_m is None:
+        distance = 0xFF
+        capabilities = 0x00
+    else:
+        distance = distance_m & 0xFF
+        capabilities = 1 << 2
+    fe_state = (fe_state & 0x0F) << 4
     return [
         0x10,
         FE_TYPE_TRAINER & 0xFF,
         elapsed_time & 0xFF,
-        0xFF,
+        distance,
         speed & 0xFF,
         (speed >> 8) & 0xFF,
         0xFF,
@@ -77,257 +85,266 @@ def build_page_10(elapsed_time: int, speed_mps: float) -> list[int]:
 
 
 def build_page_19(
-    event: int, cadence_rpm: int, accumulated_power: int, instant_power: int
+    event: int,
+    cadence_rpm: Optional[int],
+    accumulated_power: int,
+    instant_power: Optional[int],
+    fe_state: int,
 ) -> list[int]:
-    instant_power &= 0x0FFF
+    if cadence_rpm is None:
+        cadence = 0xFF
+    else:
+        cadence = clamp_int(int(round(cadence_rpm)), 0, 254)
+    if instant_power is None:
+        instant = 0x0FFF
+        accumulated = 0xFFFF
+    else:
+        instant = clamp_int(int(round(instant_power)), 0, 0x0FFE)
+        accumulated = accumulated_power & 0xFFFF
     trainer_status = 0x00
     flags = 0x00
-    fe_state = (FE_STATE_IN_USE & 0x0F) << 4
+    fe_state = (fe_state & 0x0F) << 4
     return [
         0x19,
         event & 0xFF,
-        cadence_rpm & 0xFF,
-        accumulated_power & 0xFF,
-        (accumulated_power >> 8) & 0xFF,
-        instant_power & 0xFF,
-        ((trainer_status & 0x0F) << 4) | ((instant_power >> 8) & 0x0F),
+        cadence & 0xFF,
+        accumulated & 0xFF,
+        (accumulated >> 8) & 0xFF,
+        instant & 0xFF,
+        ((trainer_status & 0x0F) << 4) | ((instant >> 8) & 0x0F),
         (fe_state & 0xF0) | (flags & 0x0F),
     ]
 
 
-def build_page_50() -> list[int]:
-    return [
-        0x50,
-        0xFF,
-        0xFF,
-        HW_REVISION & 0xFF,
-        *_le16(MANUFACTURER_ID),
-        *_le16(MODEL_NUMBER),
-    ]
+def parse_indoor_bike_data(message: bytes) -> dict:
+    data = {
+        "instant_speed": None,
+        "instant_cadence": None,
+        "total_distance": None,
+        "instant_power": None,
+        "elapsed_time": None,
+    }
+    if len(message) < 2:
+        return data
+    flag_more_data = bool(message[0] & 0b00000001)
+    flag_average_speed = bool(message[0] & 0b00000010)
+    flag_instantaneous_cadence = bool(message[0] & 0b00000100)
+    flag_average_cadence = bool(message[0] & 0b00001000)
+    flag_total_distance = bool(message[0] & 0b00010000)
+    flag_resistance_level = bool(message[0] & 0b00100000)
+    flag_instantaneous_power = bool(message[0] & 0b01000000)
+    flag_average_power = bool(message[0] & 0b10000000)
+    flag_expended_energy = bool(message[1] & 0b00000001)
+    flag_heart_rate = bool(message[1] & 0b00000010)
+    flag_metabolic_equivalent = bool(message[1] & 0b00000100)
+    flag_elapsed_time = bool(message[1] & 0b00001000)
+    flag_remaining_time = bool(message[1] & 0b00010000)
 
-
-def build_page_51() -> list[int]:
-    return [
-        0x51,
-        0xFF,
-        SW_REVISION_SUP & 0xFF,
-        SW_REVISION & 0xFF,
-        *_le32(SERIAL_NUMBER),
-    ]
-
-
-def build_page_47(
-    last_command_page: int,
-    last_command_sequence: int,
-    last_command_status: int,
-    last_command_response: list[int],
-) -> list[int]:
-    return [
-        0x47,
-        last_command_page & 0xFF,
-        last_command_sequence & 0xFF,
-        last_command_status & 0xFF,
-        *last_command_response,
-    ]
-
-
-def build_page_fc() -> list[int]:
-    return [0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
-
-
-def build_page(page: int, **kwargs) -> list[int] | None:
-    if page == 0x10:
-        return build_page_10(kwargs["elapsed_time"], kwargs["speed_mps"])
-    if page == 0x19:
-        return build_page_19(
-            kwargs["event"],
-            kwargs["cadence_rpm"],
-            kwargs["accumulated_power"],
-            kwargs["instant_power"],
+    idx = 2
+    if not flag_more_data and len(message) >= idx + 2:
+        data["instant_speed"] = int.from_bytes(
+            message[idx : idx + 2], "little", signed=False
+        ) / 100
+        idx += 2
+    if flag_average_speed and len(message) >= idx + 2:
+        idx += 2
+    if flag_instantaneous_cadence and len(message) >= idx + 2:
+        data["instant_cadence"] = int.from_bytes(
+            message[idx : idx + 2], "little", signed=False
+        ) / 2
+        idx += 2
+    if flag_average_cadence and len(message) >= idx + 2:
+        idx += 2
+    if flag_total_distance and len(message) >= idx + 3:
+        data["total_distance"] = int.from_bytes(
+            message[idx : idx + 3], "little", signed=False
         )
-    if page == 0x36:
-        return TRAINER_CAPABILITIES[:]
-    if page == 0x47:
-        return build_page_47(
-            kwargs["last_command_page"],
-            kwargs["last_command_sequence"],
-            kwargs["last_command_status"],
-            kwargs["last_command_response"],
+        idx += 3
+    if flag_resistance_level and len(message) >= idx + 2:
+        idx += 2
+    if flag_instantaneous_power and len(message) >= idx + 2:
+        data["instant_power"] = int.from_bytes(
+            message[idx : idx + 2], "little", signed=True
         )
-    if page == 0x50:
-        return build_page_50()
-    if page == 0x51:
-        return build_page_51()
-    if page == 0xFC:
-        return build_page_fc()
-    return None
+        idx += 2
+    if flag_average_power and len(message) >= idx + 2:
+        idx += 2
+    if flag_expended_energy and len(message) >= idx + 5:
+        idx += 5
+    if flag_heart_rate and len(message) >= idx + 1:
+        idx += 1
+    if flag_metabolic_equivalent and len(message) >= idx + 1:
+        idx += 1
+    if flag_elapsed_time and len(message) >= idx + 2:
+        data["elapsed_time"] = int.from_bytes(
+            message[idx : idx + 2], "little", signed=False
+        )
+        idx += 2
+    if flag_remaining_time and len(message) >= idx + 2:
+        idx += 2
+    return data
 
 
-def send_response(channel: Channel, payload: list[int], use_ack: bool) -> None:
-    if use_ack:
-        try:
-            channel._ant.send_acknowledged_data(channel.id, payload)
-            print("TX ack page=0x%02X payload=%s" % (payload[0], payload))
-            return
-        except Exception as exc:
-            print("TX ack failed, falling back to broadcast: %s" % (exc,))
-    channel.send_broadcast_data(payload)
-    print("TX resp page=0x%02X payload=%s" % (payload[0], payload))
+def update_state_from_ftms(state: BridgeState, data: dict) -> None:
+    with state.lock:
+        state.last_ftms_update = time.monotonic()
+        if data.get("instant_speed") is not None:
+            state.speed_mps = float(data["instant_speed"]) / 3.6
+        if data.get("instant_cadence") is not None:
+            state.cadence_rpm = int(round(data["instant_cadence"]))
+        if data.get("instant_power") is not None:
+            state.instant_power = int(round(data["instant_power"]))
+        if data.get("total_distance") is not None:
+            state.distance_m = int(data["total_distance"])
+        if data.get("elapsed_time") is not None:
+            state.elapsed_time_s = int(data["elapsed_time"])
 
 
-def main():
+def run_ant_bridge(state: BridgeState, stop_event: threading.Event) -> None:
     node = Node()
-    print("Node created; starting dispatch loop thread")
+    node.set_network_key(ANTPLUS_NETWORK, ANTPLUS_KEY)
+
+    ch = node.new_channel(Channel.Type.BIDIRECTIONAL_TRANSMIT)
+    ch.set_id(DEVICE_NUMBER, DEVICE_TYPE, TRANSMISSION_TYPE)
+    ch.set_period(CHANNEL_PERIOD)
+    ch.set_rf_freq(RF_FREQ)
+    ch.open()
+
+    logger.info(
+        "ANT+ channel open: name={} dev={} type=0x{:02X} tx=0x{:02X}",
+        DEVICE_NAME,
+        DEVICE_NUMBER,
+        DEVICE_TYPE,
+        TRANSMISSION_TYPE,
+    )
+
     dispatch_thread = threading.Thread(
         target=node.start, name="ant-dispatch", daemon=True
     )
     dispatch_thread.start()
-    node.get_capabilities()
 
-    # Set ANT+ network key on the node
-    node.set_network_key(ANTPLUS_NETWORK, ANTPLUS_KEY)
-
-    ch = node.new_channel(Channel.Type.BIDIRECTIONAL_TRANSMIT)
-
-    ch.set_id(DEVICE_NUMBER, DEVICE_TYPE, TRANSMISSION_TYPE)
-    ch.set_period(CHANNEL_PERIOD)
-    ch.set_rf_freq(RF_FREQ)
-
-    ch.open()
-    print(
-        "ANT+ channel open: dev=%s type=0x%02X tx=0x%02X freq=%s period=%s"
-        % (DEVICE_NUMBER, DEVICE_TYPE, TRANSMISSION_TYPE, RF_FREQ, CHANNEL_PERIOD)
-    )
-
-    requested_pages: queue.SimpleQueue[tuple[int, int, bool, int]] = queue.SimpleQueue()
-    last_command_page = 0xFF
-    last_command_sequence = 0xFF
-    last_command_status = 0xFF
-    last_command_response = [0xFF, 0xFF, 0xFF, 0xFF]
-
-    def on_rx(data):
-        nonlocal last_command_page, last_command_sequence, last_command_status, last_command_response
-        values = list(data)
-        page = values[0] if values else None
-        if page == REQUEST_PAGE and len(values) >= 8:
-            response_control = values[5]
-            requested_page = values[6]
-            command_type = values[7]
-            transmit_count = response_control & REQUESTED_RESPONSE_COUNT_MASK
-            use_ack = (response_control & REQUESTED_RESPONSE_ACK_MASK) != 0
-            requested_pages.put((requested_page, transmit_count, use_ack, command_type))
-            print(
-                "RX request page=0x%02X count=%s ack=%s cmd=0x%02X raw=%s"
-                % (requested_page, transmit_count, use_ack, command_type, values)
-            )
-            return
-        if page in (0x30, 0x31, 0x32, 0x33) and len(values) >= 8:
-            last_command_page = page
-            if last_command_sequence == 0xFF:
-                last_command_sequence = 0
-            else:
-                last_command_sequence = (last_command_sequence + 1) % 255
-            last_command_status = 0x00
-            if page == 0x30:
-                last_command_response = [0xFF, 0xFF, 0xFF, values[7]]
-            elif page == 0x31:
-                last_command_response = [0xFF, 0xFF, values[6], values[7]]
-            elif page == 0x32:
-                last_command_response = [0xFF, values[5], values[6], values[7]]
-            elif page == 0x33:
-                last_command_response = [0xFF, values[5], values[6], values[7]]
-            print("RX control page=0x%02X raw=%s" % (page, values))
-            return
-        print("RX:", data)
-
-    ch.on_broadcast_data = on_rx
-    ch.on_acknowledge_data = on_rx
-    ch.on_burst_data = on_rx
-
-    pages = itertools.cycle([0x10, 0x19, 0x50, 0x51])
+    pages = itertools.cycle([0x10, 0x19])
     page25_event = 0
     elapsed_time = 0
-    speed_mps = 0.0
-    cadence_rpm = 85
-    instant_power = 180
     accumulated_power = 0
+    last_stats_log = 0.0
 
     try:
-        while True:
-            try:
-                requested_page, transmit_count, use_ack, command_type = (
-                    requested_pages.get_nowait()
-                )
-            except queue.Empty:
-                requested_page = None
+        while not stop_event.is_set():
+            with state.lock:
+                speed_mps = state.speed_mps
+                cadence_rpm = state.cadence_rpm
+                instant_power = state.instant_power
+                distance_m = state.distance_m
+                elapsed_time_s = state.elapsed_time_s
+                last_ftms_update = state.last_ftms_update
 
-            if requested_page is not None:
-                if command_type != REQUEST_COMMAND_DATA_PAGE:
-                    print(
-                        "RX request ignored (unsupported cmd=0x%02X) raw page=0x%02X"
-                        % (command_type, requested_page)
-                    )
-                else:
-                    payload = build_page(
-                        requested_page,
-                        event=page25_event,
-                        elapsed_time=elapsed_time,
-                        speed_mps=speed_mps,
-                        cadence_rpm=cadence_rpm,
-                        accumulated_power=accumulated_power,
-                        instant_power=instant_power,
-                        last_command_page=last_command_page,
-                        last_command_sequence=last_command_sequence,
-                        last_command_status=last_command_status,
-                        last_command_response=last_command_response,
-                    )
-
-                    if payload is None:
-                        print(
-                            "RX request page=0x%02X has no handler; ignoring"
-                            % (requested_page,)
-                        )
-                    else:
-                        send_response(ch, payload, use_ack)
-
-                    count = transmit_count if transmit_count > 0 else 1
-                    if count > 1:
-                        requested_pages.put(
-                            (requested_page, count - 1, use_ack, command_type)
-                        )
+            fe_state = compute_fe_state(cadence_rpm, instant_power)
 
             page = next(pages)
             if page == 0x19:
-                accumulated_power = (accumulated_power + instant_power) & 0xFFFF
+                if instant_power is not None:
+                    accumulated_power = (
+                        accumulated_power + clamp_int(int(round(instant_power)), 0, 0x0FFE)
+                    ) & 0xFFFF
                 page25_event = (page25_event + 1) & 0xFF
 
-            payload = build_page(
-                page,
-                event=page25_event,
-                elapsed_time=elapsed_time,
-                speed_mps=speed_mps,
-                cadence_rpm=cadence_rpm,
-                accumulated_power=accumulated_power,
-                instant_power=instant_power,
-                last_command_page=last_command_page,
-                last_command_sequence=last_command_sequence,
-                last_command_status=last_command_status,
-                last_command_response=last_command_response,
-            )
+            if elapsed_time_s is not None:
+                elapsed_time_value = int(elapsed_time_s * 4) & 0xFF
+            else:
+                elapsed_time_value = elapsed_time
 
-            if payload is not None:
-                print(
-                    "TX page=0x%02X event=%s payload=%s"
-                    % (page, page25_event, payload)
+            if page == 0x10:
+                payload = build_page_10(
+                    elapsed_time_value, speed_mps, distance_m, fe_state
                 )
-                ch.send_broadcast_data(payload)
+            else:
+                payload = build_page_19(
+                    page25_event, cadence_rpm, accumulated_power, instant_power, fe_state
+                )
 
-            elapsed_time = (elapsed_time + 1) & 0xFF
+            ch.send_broadcast_data(payload)
+
+            now = time.monotonic()
+            if now - last_stats_log >= 1.0:
+                last_stats_log = now
+                speed_kmh = None if speed_mps is None else speed_mps * 3.6
+                if last_ftms_update is None:
+                    ftms_age = "never"
+                else:
+                    ftms_age = f"{now - last_ftms_update:.1f}s ago"
+                logger.info(
+                    "Stats: speed={} km/h cadence={} rpm power={} W distance={} m elapsed={} s (ftms={})",
+                    "-" if speed_kmh is None else f"{speed_kmh:.1f}",
+                    "-" if cadence_rpm is None else cadence_rpm,
+                    "-" if instant_power is None else instant_power,
+                    "-" if distance_m is None else distance_m,
+                    "-" if elapsed_time_s is None else elapsed_time_s,
+                    ftms_age,
+                )
+
+            if elapsed_time_s is None:
+                elapsed_time = (elapsed_time + 1) & 0xFF
             time.sleep(0.25)
     finally:
         ch.close()
         node.stop()
         dispatch_thread.join(timeout=2.0)
+
+
+def build_ftms_control_command(opcode: int) -> bytes:
+    return bytes([opcode])
+
+
+async def run_bridge() -> None:
+    logger.info("Scanning for FTMS bike named {}", FTMS_DEVICE_NAME)
+    device = await BleakScanner.find_device_by_name(FTMS_DEVICE_NAME)
+    if not device:
+        logger.error("FTMS device not found: {}", FTMS_DEVICE_NAME)
+        return
+
+    logger.info("Found FTMS device: name={} address={}", device.name, device.address)
+
+    state = BridgeState()
+    stop_event = threading.Event()
+    ant_thread = threading.Thread(
+        target=run_ant_bridge, args=(state, stop_event), daemon=True
+    )
+    ant_thread.start()
+
+    try:
+        async with BleakClient(device.address, timeout=30, services=[FTMS_SERVICE_UUID]) as client:
+            logger.info("FTMS connected")
+
+            def on_indoor_bike_data(_sender, data):
+                parsed = parse_indoor_bike_data(bytes(data))
+                update_state_from_ftms(state, parsed)
+
+            await client.start_notify(FTMS_CHAR_INDOOR_BIKE_DATA, on_indoor_bike_data)
+            logger.info("FTMS indoor bike data notifications enabled")
+
+            try:
+                payload = build_ftms_control_command(FTMS_OP_REQUEST_CONTROL)
+                await client.write_gatt_char(FTMS_CHAR_CONTROL_POINT, payload, response=True)
+            except Exception as exc:
+                logger.warning("FTMS request control failed: {}", exc)
+            try:
+                payload = build_ftms_control_command(FTMS_OP_START_OR_RESUME)
+                await client.write_gatt_char(FTMS_CHAR_CONTROL_POINT, payload, response=True)
+                logger.info("FTMS start_or_resume sent")
+            except Exception as exc:
+                logger.warning("FTMS start_or_resume failed: {}", exc)
+
+            await asyncio.Future()
+    finally:
+        stop_event.set()
+        ant_thread.join(timeout=2.0)
+
+
+def main() -> None:
+    logger.remove()
+    logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level} | {message}")
+    asyncio.run(run_bridge())
 
 
 if __name__ == "__main__":
