@@ -1,23 +1,20 @@
+import asyncio
 import itertools
+import os
+import signal
 import sys
 import threading
 import time
 from collections import deque
 from typing import Optional
 
-import objc
+from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
+from bleak.exc import BleakBluetoothNotAvailableError
 from loguru import logger
 from openant.easy.channel import Channel
 from openant.easy.node import Node
-
-from CoreBluetooth import (
-    CBAdvertisementDataLocalNameKey,
-    CBCharacteristicWriteWithResponse,
-    CBManagerStatePoweredOn,
-    CBCentralManager,
-    CBUUID,
-)
-from Foundation import NSDate, NSData, NSRunLoop, NSObject
+from pycycling.fitness_machine_service import FitnessMachineService
 
 ANTPLUS_NETWORK = 0
 ANTPLUS_KEY = list(bytes.fromhex("B9A521FBBD72C345"))
@@ -30,13 +27,12 @@ TRANSMISSION_TYPE = 0x05
 RF_FREQ = 57
 CHANNEL_PERIOD = 8192  # 4 Hz
 
-FTMS_DEVICE_NAME = "SB-700"
-FTMS_SERVICE_UUID = "1826"
-FTMS_CHAR_INDOOR_BIKE_DATA = "2ad2"
-FTMS_CHAR_CONTROL_POINT = "2ad9"
-
-FTMS_OP_REQUEST_CONTROL = 0x00
-FTMS_OP_START_OR_RESUME = 0x07
+FTMS_DEVICE_NAME = os.getenv("FTMS_DEVICE_NAME", "SB-700")
+FTMS_DEVICE_ADDRESS = os.getenv("FTMS_DEVICE_ADDRESS")
+FTMS_SERVICE_UUID = "00001826-0000-1000-8000-00805f9b34fb"
+FTMS_SCAN_TIMEOUT_S = 8.0
+FTMS_RECONNECT_DELAY_S = 2.0
+FTMS_CONTROL_DELAY_S = 0.2
 
 FE_TYPE_TRAINER = 25
 FE_STATE_READY = 2
@@ -149,76 +145,20 @@ def build_page_19(
     ]
 
 
-def parse_indoor_bike_data(message: bytes) -> dict:
-    data = {
-        "instant_speed": None,
-        "instant_cadence": None,
-        "total_distance": None,
-        "instant_power": None,
-        "elapsed_time": None,
-    }
-    if len(message) < 2:
-        return data
-    flag_more_data = bool(message[0] & 0b00000001)
-    flag_average_speed = bool(message[0] & 0b00000010)
-    flag_instantaneous_cadence = bool(message[0] & 0b00000100)
-    flag_average_cadence = bool(message[0] & 0b00001000)
-    flag_total_distance = bool(message[0] & 0b00010000)
-    flag_resistance_level = bool(message[0] & 0b00100000)
-    flag_instantaneous_power = bool(message[0] & 0b01000000)
-    flag_average_power = bool(message[0] & 0b10000000)
-    flag_expended_energy = bool(message[1] & 0b00000001)
-    flag_heart_rate = bool(message[1] & 0b00000010)
-    flag_metabolic_equivalent = bool(message[1] & 0b00000100)
-    flag_elapsed_time = bool(message[1] & 0b00001000)
-    flag_remaining_time = bool(message[1] & 0b00010000)
-
-    idx = 2
-    if not flag_more_data and len(message) >= idx + 2:
-        data["instant_speed"] = int.from_bytes(
-            message[idx : idx + 2], "little", signed=False
-        ) / 100
-        idx += 2
-    if flag_average_speed and len(message) >= idx + 2:
-        idx += 2
-    if flag_instantaneous_cadence and len(message) >= idx + 2:
-        data["instant_cadence"] = int.from_bytes(
-            message[idx : idx + 2], "little", signed=False
-        ) / 2
-        idx += 2
-    if flag_average_cadence and len(message) >= idx + 2:
-        idx += 2
-    if flag_total_distance and len(message) >= idx + 3:
-        data["total_distance"] = int.from_bytes(
-            message[idx : idx + 3], "little", signed=False
-        )
-        idx += 3
-    if flag_resistance_level and len(message) >= idx + 2:
-        idx += 2
-    if flag_instantaneous_power and len(message) >= idx + 2:
-        data["instant_power"] = int.from_bytes(
-            message[idx : idx + 2], "little", signed=True
-        )
-        idx += 2
-    if flag_average_power and len(message) >= idx + 2:
-        idx += 2
-    if flag_expended_energy and len(message) >= idx + 5:
-        idx += 5
-    if flag_heart_rate and len(message) >= idx + 1:
-        idx += 1
-    if flag_metabolic_equivalent and len(message) >= idx + 1:
-        idx += 1
-    if flag_elapsed_time and len(message) >= idx + 2:
-        data["elapsed_time"] = int.from_bytes(
-            message[idx : idx + 2], "little", signed=False
-        )
-        idx += 2
-    if flag_remaining_time and len(message) >= idx + 2:
-        idx += 2
-    return data
-
-
-def update_state_from_ftms(state: BridgeState, data: dict) -> None:
+def update_state_from_ftms(state: BridgeState, data) -> None:
+    if data is None:
+        return
+    if not isinstance(data, dict):
+        if hasattr(data, "_asdict"):
+            data = data._asdict()
+        else:
+            data = {
+                "instant_speed": getattr(data, "instant_speed", None),
+                "instant_cadence": getattr(data, "instant_cadence", None),
+                "total_distance": getattr(data, "total_distance", None),
+                "instant_power": getattr(data, "instant_power", None),
+                "elapsed_time": getattr(data, "elapsed_time", None),
+            }
     now = time.monotonic()
     with state.lock:
         last_update = state.last_ftms_update
@@ -344,166 +284,114 @@ def run_ant_bridge(state: BridgeState, stop_event: threading.Event) -> None:
         dispatch_thread.join(timeout=2.0)
 
 
-def build_ftms_control_command(opcode: int) -> NSData:
-    payload = bytes([opcode])
-    return NSData.dataWithBytes_length_(payload, len(payload))
+async def _find_ftms_device_by_name(target_name: str) -> Optional[BLEDevice]:
+    def matches(device, advertisement_data) -> bool:
+        name = advertisement_data.local_name or device.name
+        return bool(name and target_name in name)
 
-
-class FTMSClient(NSObject):
-    __pyobjc_protocols__ = [
-        objc.protocolNamed("CBCentralManagerDelegate"),
-        objc.protocolNamed("CBPeripheralDelegate"),
-    ]
-
-    def initWithState_targetName_(self, state: BridgeState, target_name: str):
-        self = objc.super(FTMSClient, self).init()
-        if self is None:
+    device = None
+    try:
+        device = await BleakScanner.find_device_by_filter(
+            matches,
+            timeout=FTMS_SCAN_TIMEOUT_S,
+            service_uuids=[FTMS_SERVICE_UUID],
+        )
+    except BleakBluetoothNotAvailableError as exc:
+        logger.warning("Bluetooth not available: {}", exc)
+        return None
+    if device is None:
+        try:
+            device = await BleakScanner.find_device_by_filter(
+                matches,
+                timeout=FTMS_SCAN_TIMEOUT_S,
+            )
+        except BleakBluetoothNotAvailableError as exc:
+            logger.warning("Bluetooth not available: {}", exc)
             return None
-        self.state = state
-        self.target_name = target_name
-        self.scanning = False
-        self.data_count = 0
-        self.central = CBCentralManager.alloc().initWithDelegate_queue_options_(
-            self, None, None
-        )
-        self.peripheral = None
-        self.char_bike = None
-        self.char_control = None
-        self.ftms_uuid = CBUUID.UUIDWithString_(FTMS_SERVICE_UUID)
-        self.bike_uuid = CBUUID.UUIDWithString_(FTMS_CHAR_INDOOR_BIKE_DATA)
-        self.control_uuid = CBUUID.UUIDWithString_(FTMS_CHAR_CONTROL_POINT)
-        return self
-
-    def centralManagerDidUpdateState_(self, central):
-        if central.state() != CBManagerStatePoweredOn:
-            logger.warning("Bluetooth not ready: {}", central.state())
-            return
-        logger.info("BLE scanning for {}", self.target_name)
-        central.scanForPeripheralsWithServices_options_([self.ftms_uuid], None)
-        self.scanning = True
-
-    def centralManager_didDiscoverPeripheral_advertisementData_RSSI_(
-        self, central, peripheral, advertisementData, _rssi
-    ):
-        name = advertisementData.get(CBAdvertisementDataLocalNameKey) or peripheral.name()
-        if not name or self.target_name not in name:
-            return
-        logger.info("BLE found {}", name)
-        self.peripheral = peripheral
-        self.peripheral.setDelegate_(self)
-        central.stopScan()
-        self.scanning = False
-        central.connectPeripheral_options_(peripheral, None)
-
-    def centralManager_didConnectPeripheral_(self, _central, peripheral):
-        logger.info("BLE connected; discovering services")
-        peripheral.discoverServices_(None)
-
-    def centralManager_didFailToConnectPeripheral_error_(
-        self, _central, _peripheral, error
-    ):
-        logger.warning("BLE connect failed: {}", error)
-
-    def centralManager_didDisconnectPeripheral_error_(
-        self, _central, _peripheral, error
-    ):
-        logger.warning("BLE disconnected: {}", error)
-        self.peripheral = None
-        self.char_bike = None
-        self.char_control = None
-
-    def ensure_scan(self) -> None:
-        if self.peripheral is not None or self.scanning:
-            return
-        if self.central.state() != CBManagerStatePoweredOn:
-            return
-        logger.info("BLE scanning for {}", self.target_name)
-        self.central.scanForPeripheralsWithServices_options_([self.ftms_uuid], None)
-        self.scanning = True
-
-    def peripheral_didDiscoverServices_(self, peripheral, error):
-        if error:
-            logger.warning("Service discovery failed: {}", error)
-            return
-        services = peripheral.services() or []
-        if not services:
-            logger.warning("No BLE services discovered")
-        for service in services:
-            uuid_str = service.UUID().UUIDString().lower()
-            logger.info("BLE service: {}", uuid_str)
-            if uuid_str == FTMS_SERVICE_UUID:
-                logger.info("BLE FTMS service matched; discovering characteristics")
-                peripheral.discoverCharacteristics_forService_(None, service)
-
-    def peripheral_didDiscoverCharacteristicsForService_error_(
-        self, peripheral, service, error
-    ):
-        if error:
-            logger.warning("Characteristic discovery failed: {}", error)
-            return
-        chars = service.characteristics() or []
-        if not chars:
-            logger.warning("No BLE characteristics discovered for service")
-        for char in chars:
-            uuid = char.UUID().UUIDString().lower()
-            logger.info("BLE characteristic: {}", uuid)
-            if uuid == FTMS_CHAR_INDOOR_BIKE_DATA:
-                self.char_bike = char
-                logger.info("BLE subscribing to indoor bike data")
-                peripheral.setNotifyValue_forCharacteristic_(True, char)
-            elif uuid == FTMS_CHAR_CONTROL_POINT:
-                self.char_control = char
-        if self.char_control:
-            self._send_control(FTMS_OP_REQUEST_CONTROL)
-            self._send_control(FTMS_OP_START_OR_RESUME)
-
-    def peripheral_didUpdateNotificationStateForCharacteristic_error_(
-        self, _peripheral, characteristic, error
-    ):
-        if error:
-            logger.warning("Notify failed: {}", error)
-            return
-        logger.info("Notify enabled: {}", characteristic.UUID().UUIDString())
-
-    def peripheral_didUpdateValueForCharacteristic_error_(
-        self, _peripheral, characteristic, error
-    ):
-        if error:
-            logger.warning("Notify error: {}", error)
-            return
-        if characteristic.UUID().UUIDString().lower() != FTMS_CHAR_INDOOR_BIKE_DATA:
-            return
-        data = bytes(characteristic.value())
-        self.data_count += 1
-        if self.data_count <= 5:
-            logger.info("FTMS data packet {} bytes={}", self.data_count, list(data))
-        parsed = parse_indoor_bike_data(data)
-        update_state_from_ftms(self.state, parsed)
-
-    def peripheral_didWriteValueForCharacteristic_error_(
-        self, _peripheral, _characteristic, error
-    ):
-        if error:
-            logger.warning("Control write failed: {}", error)
-
-    def _send_control(self, opcode: int) -> None:
-        if not self.char_control or not self.peripheral:
-            return
-        payload = build_ftms_control_command(opcode)
-        self.peripheral.writeValue_forCharacteristic_type_(
-            payload, self.char_control, CBCharacteristicWriteWithResponse
-        )
+    return device
 
 
-def run_corebluetooth(state: BridgeState, stop_event: threading.Event) -> None:
-    client = FTMSClient.alloc().initWithState_targetName_(state, FTMS_DEVICE_NAME)
-    if client is None:
-        logger.error("Failed to initialize CoreBluetooth client")
-        return
-    run_loop = NSRunLoop.currentRunLoop()
-    while not stop_event.is_set():
-        client.ensure_scan()
-        run_loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+async def _resolve_ftms_device() -> Optional[BLEDevice]:
+    if FTMS_DEVICE_ADDRESS:
+        logger.info("BLE scanning for address {}", FTMS_DEVICE_ADDRESS)
+        try:
+            device = await BleakScanner.find_device_by_address(
+                FTMS_DEVICE_ADDRESS,
+                timeout=FTMS_SCAN_TIMEOUT_S,
+            )
+        except BleakBluetoothNotAvailableError as exc:
+            logger.warning("Bluetooth not available: {}", exc)
+            return None
+        return device
+    logger.info("BLE scanning for {}", FTMS_DEVICE_NAME)
+    return await _find_ftms_device_by_name(FTMS_DEVICE_NAME)
+
+
+async def run_ftms_bridge(state: BridgeState, stop_event: threading.Event) -> None:
+    current_client: Optional[BleakClient] = None
+    try:
+        while not stop_event.is_set():
+            device = await _resolve_ftms_device()
+            if device is None:
+                await asyncio.sleep(FTMS_RECONNECT_DELAY_S)
+                continue
+
+            def handle_disconnect(client: BleakClient) -> None:
+                logger.warning("BLE disconnected: {}", client.address)
+
+            data_count = 0
+
+            def handle_bike_data(data) -> None:
+                nonlocal data_count
+                data_count += 1
+                if data_count <= 5:
+                    try:
+                        payload = data._asdict()
+                    except AttributeError:
+                        payload = data
+                    logger.info("FTMS data packet {} data={}", data_count, payload)
+                update_state_from_ftms(state, data)
+
+            def handle_control_response(response) -> None:
+                logger.info(
+                    "FTMS control response: {} {}",
+                    response.request_code_enum.name,
+                    response.result_code_enum.name,
+                )
+
+            try:
+                logger.info(
+                    "BLE connecting to {} ({})",
+                    device.name or FTMS_DEVICE_NAME,
+                    device.address,
+                )
+                client = BleakClient(device, disconnected_callback=handle_disconnect)
+                current_client = client
+                await client.connect()
+                logger.info("BLE connected: {}", client.address)
+                fms = FitnessMachineService(client)
+                fms.set_indoor_bike_data_handler(handle_bike_data)
+                fms.set_control_point_response_handler(handle_control_response)
+                await fms.enable_control_point_indicate()
+                await fms.enable_indoor_bike_data_notify()
+                await fms.request_control()
+                await asyncio.sleep(FTMS_CONTROL_DELAY_S)
+                await fms.start_or_resume()
+                while client.is_connected and not stop_event.is_set():
+                    await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("BLE session error: {}", exc)
+            finally:
+                if current_client is not None and current_client.is_connected:
+                    await current_client.disconnect()
+                current_client = None
+            if not stop_event.is_set():
+                await asyncio.sleep(FTMS_RECONNECT_DELAY_S)
+    finally:
+        if current_client is not None and current_client.is_connected:
+            await current_client.disconnect()
 
 
 def main() -> None:
@@ -512,13 +400,21 @@ def main() -> None:
 
     state = BridgeState()
     stop_event = threading.Event()
+
+    def handle_signal(signum, _frame) -> None:
+        logger.info("Signal received: {}", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
     ant_thread = threading.Thread(
         target=run_ant_bridge, args=(state, stop_event), daemon=True
     )
     ant_thread.start()
 
     try:
-        run_corebluetooth(state, stop_event)
+        asyncio.run(run_ftms_bridge(state, stop_event))
     except KeyboardInterrupt:
         pass
     finally:
