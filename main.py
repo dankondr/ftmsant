@@ -2,6 +2,7 @@ import itertools
 import sys
 import threading
 import time
+from collections import deque
 from typing import Optional
 
 import objc
@@ -41,6 +42,27 @@ FE_TYPE_TRAINER = 25
 FE_STATE_READY = 2
 FE_STATE_IN_USE = 3
 
+OUTLIER_WINDOW = 3
+OUTLIER_RESET_S = 3.0
+
+
+class RollingMedianFilter:
+    def __init__(self, window: int) -> None:
+        self.window = window
+        self.values = deque(maxlen=window)
+
+    def reset(self) -> None:
+        self.values.clear()
+
+    def update(self, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        self.values.append(float(value))
+        if len(self.values) < self.window:
+            return float(value)
+        sorted_values = sorted(self.values)
+        return sorted_values[len(sorted_values) // 2]
+
 
 class BridgeState:
     def __init__(self) -> None:
@@ -51,6 +73,9 @@ class BridgeState:
         self.distance_m: Optional[int] = None
         self.elapsed_time_s: Optional[int] = None
         self.last_ftms_update: Optional[float] = None
+        self.speed_filter = RollingMedianFilter(OUTLIER_WINDOW)
+        self.cadence_filter = RollingMedianFilter(OUTLIER_WINDOW)
+        self.power_filter = RollingMedianFilter(OUTLIER_WINDOW)
 
 
 def clamp_int(value: int, low: int, high: int) -> int:
@@ -194,14 +219,29 @@ def parse_indoor_bike_data(message: bytes) -> dict:
 
 
 def update_state_from_ftms(state: BridgeState, data: dict) -> None:
+    now = time.monotonic()
     with state.lock:
-        state.last_ftms_update = time.monotonic()
+        last_update = state.last_ftms_update
+        state.last_ftms_update = now
+        if last_update is not None and now - last_update > OUTLIER_RESET_S:
+            state.speed_filter.reset()
+            state.cadence_filter.reset()
+            state.power_filter.reset()
         if data.get("instant_speed") is not None:
-            state.speed_mps = float(data["instant_speed"]) / 3.6
+            speed_mps = float(data["instant_speed"]) / 3.6
+            filtered_speed = state.speed_filter.update(speed_mps)
+            if filtered_speed is not None:
+                state.speed_mps = filtered_speed
         if data.get("instant_cadence") is not None:
-            state.cadence_rpm = int(round(data["instant_cadence"]))
+            cadence = float(data["instant_cadence"])
+            filtered_cadence = state.cadence_filter.update(cadence)
+            if filtered_cadence is not None:
+                state.cadence_rpm = int(round(filtered_cadence))
         if data.get("instant_power") is not None:
-            state.instant_power = int(round(data["instant_power"]))
+            power = float(data["instant_power"])
+            filtered_power = state.power_filter.update(power)
+            if filtered_power is not None:
+                state.instant_power = int(round(filtered_power))
         if data.get("total_distance") is not None:
             state.distance_m = int(data["total_distance"])
         if data.get("elapsed_time") is not None:
