@@ -42,6 +42,21 @@ OUTLIER_WINDOW = 3
 OUTLIER_RESET_S = 3.0
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+SPEED_MAX_UP_MPS_S = _env_float("SPEED_MAX_UP_MPS_S", 2.5)
+CADENCE_MAX_UP_RPM_S = _env_float("CADENCE_MAX_UP_RPM_S", 40.0)
+POWER_MAX_UP_W_S = _env_float("POWER_MAX_UP_W_S", 300.0)
+
+
 class RollingMedianFilter:
     def __init__(self, window: int) -> None:
         self.window = window
@@ -60,6 +75,36 @@ class RollingMedianFilter:
         return sorted_values[len(sorted_values) // 2]
 
 
+class SlewRateLimiter:
+    def __init__(self, max_up_per_s: float) -> None:
+        self.max_up_per_s = max_up_per_s
+        self.last_value: Optional[float] = None
+        self.last_time: Optional[float] = None
+
+    def reset(self) -> None:
+        self.last_value = None
+        self.last_time = None
+
+    def update(self, value: Optional[float], now: float) -> Optional[float]:
+        if value is None:
+            return None
+        value = float(value)
+        if self.last_value is None or self.last_time is None:
+            self.last_value = value
+            self.last_time = now
+            return value
+        dt = max(now - self.last_time, 0.0)
+        if dt <= 0.0:
+            return self.last_value
+        if self.max_up_per_s > 0 and value > self.last_value:
+            max_value = self.last_value + self.max_up_per_s * dt
+            if value > max_value:
+                value = max_value
+        self.last_value = value
+        self.last_time = now
+        return value
+
+
 class BridgeState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -69,6 +114,9 @@ class BridgeState:
         self.distance_m: Optional[int] = None
         self.elapsed_time_s: Optional[int] = None
         self.last_ftms_update: Optional[float] = None
+        self.speed_limiter = SlewRateLimiter(SPEED_MAX_UP_MPS_S)
+        self.cadence_limiter = SlewRateLimiter(CADENCE_MAX_UP_RPM_S)
+        self.power_limiter = SlewRateLimiter(POWER_MAX_UP_W_S)
         self.speed_filter = RollingMedianFilter(OUTLIER_WINDOW)
         self.cadence_filter = RollingMedianFilter(OUTLIER_WINDOW)
         self.power_filter = RollingMedianFilter(OUTLIER_WINDOW)
@@ -164,22 +212,28 @@ def update_state_from_ftms(state: BridgeState, data) -> None:
         last_update = state.last_ftms_update
         state.last_ftms_update = now
         if last_update is not None and now - last_update > OUTLIER_RESET_S:
+            state.speed_limiter.reset()
+            state.cadence_limiter.reset()
+            state.power_limiter.reset()
             state.speed_filter.reset()
             state.cadence_filter.reset()
             state.power_filter.reset()
         if data.get("instant_speed") is not None:
             speed_mps = float(data["instant_speed"]) / 3.6
-            filtered_speed = state.speed_filter.update(speed_mps)
+            limited_speed = state.speed_limiter.update(speed_mps, now)
+            filtered_speed = state.speed_filter.update(limited_speed)
             if filtered_speed is not None:
                 state.speed_mps = filtered_speed
         if data.get("instant_cadence") is not None:
             cadence = float(data["instant_cadence"])
-            filtered_cadence = state.cadence_filter.update(cadence)
+            limited_cadence = state.cadence_limiter.update(cadence, now)
+            filtered_cadence = state.cadence_filter.update(limited_cadence)
             if filtered_cadence is not None:
                 state.cadence_rpm = int(round(filtered_cadence))
         if data.get("instant_power") is not None:
             power = float(data["instant_power"])
-            filtered_power = state.power_filter.update(power)
+            limited_power = state.power_limiter.update(power, now)
+            filtered_power = state.power_filter.update(limited_power)
             if filtered_power is not None:
                 state.instant_power = int(round(filtered_power))
         if data.get("total_distance") is not None:
