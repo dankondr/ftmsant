@@ -38,7 +38,7 @@ FE_TYPE_TRAINER = 25
 FE_STATE_READY = 2
 FE_STATE_IN_USE = 3
 
-OUTLIER_WINDOW = 3
+OUTLIER_WINDOW = 5
 OUTLIER_RESET_S = 3.0
 
 
@@ -52,7 +52,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-SPEED_MAX_UP_MPS_S = _env_float("SPEED_MAX_UP_MPS_S", 2.5)
+SPEED_MAX_UP_MPS_S = _env_float("SPEED_MAX_UP_MPS_S", 2.0)
 CADENCE_MAX_UP_RPM_S = _env_float("CADENCE_MAX_UP_RPM_S", 40.0)
 POWER_MAX_UP_W_S = _env_float("POWER_MAX_UP_W_S", 300.0)
 
